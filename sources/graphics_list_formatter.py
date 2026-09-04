@@ -123,10 +123,11 @@ async def make_commit_day_time_list(time_zone: str, repositories: Dict, commit_d
     week_days = [0] * 7  # Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday
 
     for repository in repositories:
-        if repository["name"] not in commit_dates.keys():
+        repo_key = f"{repository['owner']['login']}/{repository['name']}"
+        if repo_key not in commit_dates.keys():
             continue
 
-        for committed_date in [commit_date for branch in commit_dates[repository["name"]].values() for commit_date in branch.values()]:
+        for committed_date in commit_dates[repo_key].values():
             local_date = datetime.strptime(committed_date, "%Y-%m-%dT%H:%M:%SZ")
             date = local_date.replace(tzinfo=utc).astimezone(timezone(time_zone))
 

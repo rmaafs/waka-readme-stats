@@ -1,4 +1,5 @@
 import asyncio
+from time import time
 import collections.abc
 import json
 from hashlib import md5
@@ -99,6 +100,54 @@ GITHUB_API_QUERIES = {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+""",
+    # Same as `repo_commit_list` but without additions/deletions: GitHub nulls out commits whose diff stats
+    # it cannot compute (huge commits), so this query is used to recover them.
+    "repo_commit_list_light": """
+{
+    repository(owner: "$owner", name: "$name") {
+        ref(qualifiedName: "refs/heads/$branch") {
+            target {
+                ... on Commit {
+                    history(author: { id: "$id" }, $pagination) {
+                        nodes {
+                            ... on Commit {
+                                committedDate
+                                oid
+                            }
+                        }
+                        pageInfo {
+                            endCursor
+                            hasNextPage
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+""",
+    # Query to get the default branch name of the given repository.
+    "repo_default_branch": """
+{
+    repository(owner: "$owner", name: "$name") {
+        defaultBranchRef {
+            name
+        }
+    }
+}
+""",
+    # Query to count how many commits a branch has that are not reachable from the base branch.
+    "repo_branch_compare": """
+{
+    repository(owner: "$owner", name: "$name") {
+        ref(qualifiedName: "refs/heads/$base") {
+            compare(headRef: "refs/heads/$head") {
+                aheadBy
             }
         }
     }
@@ -264,12 +313,27 @@ class DownloadManager:
             "https://api.github.com/graphql", json={"query": Template(GITHUB_API_QUERIES[query]).substitute(kwargs)}, headers=headers
         )
         if res.status_code == 200:
-            return res.json()
+            body = res.json()
+            errors = body.get("errors") if isinstance(body, dict) else None
+            if "data" not in body and errors and any(err.get("type") == "RATE_LIMITED" for err in errors) and retries_count > 0:
+                # GraphQL primary rate limit exhausted: wait for the reset window and retry.
+                reset = res.headers.get("x-ratelimit-reset", "")
+                delay = min(max(int(reset) - time(), 5.0), 3600.0) if reset.isdigit() else 60.0
+                await asyncio.sleep(delay)
+                return await DownloadManager._fetch_graphql_query(query, retries_count - 1, **kwargs)
+            return body
 
         # Transient errors can happen (GitHub flakiness, rate limiting, proxies returning HTML/empty bodies).
         if res.status_code in (502, 503, 504, 429, 403) and retries_count > 0:
-            # Minimal backoff (keeps behavior simple but avoids tight recursion loops)
-            await asyncio.sleep(1.0)
+            # Honor GitHub's Retry-After (secondary rate limits), otherwise back off exponentially.
+            retry_after = res.headers.get("retry-after")
+            if retry_after is not None and retry_after.isdigit():
+                delay = min(float(retry_after), 120.0)
+            elif res.headers.get("x-ratelimit-remaining") == "0" and res.headers.get("x-ratelimit-reset", "").isdigit():
+                delay = min(max(int(res.headers["x-ratelimit-reset"]) - time(), 1.0), 300.0)
+            else:
+                delay = min(2.0 ** (10 - retries_count), 60.0)
+            await asyncio.sleep(delay)
             return await DownloadManager._fetch_graphql_query(query, retries_count - 1, **kwargs)
 
         try:
@@ -304,6 +368,10 @@ class DownloadManager:
         """
         if "nodes" in response.keys() and "pageInfo" in response.keys():
             return response["nodes"], response["pageInfo"]
+        elif "data" in response.keys() and isinstance(response["data"], dict):
+            # GitHub may return partial results: HTTP 200 with both "data" and "errors" keys
+            # (e.g. "The additions count for this commit is unavailable."). The data part is still valid.
+            return DownloadManager._find_pagination_and_data_list(response["data"])
         elif len(response) == 1 and isinstance(response[list(response.keys())[0]], dict):
             return DownloadManager._find_pagination_and_data_list(response[list(response.keys())[0]])
         else:
@@ -334,6 +402,36 @@ class DownloadManager:
             if max_nodes is not None and max_nodes > 0 and len(page_list) >= max_nodes:
                 page_list = page_list[:max_nodes]
                 break
+        return page_list
+
+    @staticmethod
+    async def iter_remote_graphql_pages(query: str, **kwargs):
+        """
+        Execute GitHub GraphQL API paginated query, yielding one page (list of nodes) at a time.
+        Unlike `get_remote_graphql`, results are NOT cached and the caller may stop iterating early,
+        which avoids downloading pages that are not needed.
+        :param query: Dynamic query identifier (must contain `$pagination`).
+        :param kwargs: Parameters for substitution of variables in dynamic query.
+        Yields `(page_nodes, pagination)` tuples, where `pagination` is the GraphQL pagination argument used
+        for that page, so the caller can re-fetch the same page with another query if needed.
+        """
+        pagination = "first: 100"
+        response = await DownloadManager._fetch_graphql_query(query, **kwargs, pagination=pagination)
+        page_list, page_info = DownloadManager._find_pagination_and_data_list(response)
+        yield page_list, pagination
+        while page_info["hasNextPage"]:
+            pagination = f'first: 100, after: "{page_info["endCursor"]}"'
+            response = await DownloadManager._fetch_graphql_query(query, **kwargs, pagination=pagination)
+            page_list, page_info = DownloadManager._find_pagination_and_data_list(response)
+            yield page_list, pagination
+
+    @staticmethod
+    async def fetch_graphql_page(query: str, pagination: str, **kwargs) -> List[dict]:
+        """
+        Fetch one page of a paginated query with an explicit pagination argument (no caching).
+        """
+        response = await DownloadManager._fetch_graphql_query(query, **kwargs, pagination=pagination)
+        page_list, _ = DownloadManager._find_pagination_and_data_list(response)
         return page_list
 
     @staticmethod
