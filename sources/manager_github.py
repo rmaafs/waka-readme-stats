@@ -78,7 +78,7 @@ class GitHubManager:
             else:
                 DBM.i("PUSH_TOKEN is identical to GH_TOKEN. Skipping extra verification.")
 
-        GitHubManager._REPO_PATH = f"https://{push_token}@github.com/{GitHubManager._REMOTE_NAME}.git"
+        GitHubManager._REPO_PATH = f"https://x-access-token:{push_token}@github.com/{GitHubManager._REMOTE_NAME}.git"
 
         # In DEBUG_RUN mode, nothing is pushed nor run
         if EM.DEBUG_RUN:
